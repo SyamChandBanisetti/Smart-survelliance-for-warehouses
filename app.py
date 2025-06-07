@@ -31,7 +31,7 @@ yolo_model, face_cascade = load_models()
 # Queue to pass frames safely between thread and main Streamlit
 frame_queue = queue.Queue(maxsize=1)
 
-# Detection counts (thread-safe dictionary would be better for concurrency)
+# Detection counts
 count_states = {
     "gunny_bags": 0,
     "boxes": 0,
@@ -48,12 +48,10 @@ def draw_gunny_box(frame, results):
             class_name = yolo_model.names[cls]
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = box.conf[0]
-            # Gunny bags classes (backpack, suitcase)
             if class_name in ["backpack", "suitcase"]:
                 label = "Gunny Bag"
                 color = (0, 255, 0)
                 gunny_count += 1
-            # Boxes class (if available)
             elif class_name == "box":
                 label = "Box"
                 color = (255, 255, 0)
@@ -98,29 +96,21 @@ def detection_worker(source):
         if not ret:
             break
 
-        # Resize frame to a smaller size to improve speed
         frame = cv2.resize(frame, (640, 480))
+        results = yolo_model(frame, imgsz=640, conf=0.3, verbose=False)
 
-        # Run YOLO detection (batch inference is faster than per-box)
-        results = yolo_model(frame, imgsz=640, conf=0.3, verbose=False)  # conf threshold can be adjusted
-
-        # Process detections for gunny bags and boxes
         frame, gunny_count, box_count = draw_gunny_box(frame, results)
         count_states["gunny_bags"] = gunny_count
         count_states["boxes"] = box_count
 
-        # Process detections for vehicles
         frame, vehicle_count = draw_vehicles(frame, results)
         count_states["vehicles"] = vehicle_count
 
-        # Detect faces
         frame, face_count = detect_faces(frame)
         count_states["faces"] = face_count
 
-        # Convert BGR to RGB for Streamlit
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Put the latest frame in queue, replacing old if exists
         if not frame_queue.empty():
             try:
                 frame_queue.get_nowait()
@@ -128,7 +118,6 @@ def detection_worker(source):
                 pass
         frame_queue.put(rgb_frame)
 
-        # Sleep to control frame rate (~30 FPS)
         time.sleep(0.03)
 
     cap.release()
@@ -150,17 +139,7 @@ else:
 
 start = st.sidebar.button("Start Detection")
 
-if start:
-    if source is None:
-        st.sidebar.error("Please select or upload a valid input source.")
-    else:
-        if "det_thread" not in st.session_state or not st.session_state.det_thread.is_alive():
-            det_thread = threading.Thread(target=detection_worker, args=(source,), daemon=True)
-            det_thread.start()
-            st.session_state.det_thread = det_thread
-            st.success("Detection started!")
-
-# Main UI showing video and live counts
+# Main UI
 st.subheader("Live Surveillance Feed")
 video_placeholder = st.empty()
 
@@ -176,17 +155,22 @@ def update_counts():
     vehicle_count_text.markdown(f"**Vehicles:** {count_states['vehicles']}")
     face_count_text.markdown(f"**Faces:** {count_states['faces']}")
 
-# Instead of an infinite loop blocking Streamlit,
-# use Streamlit's built-in functions to update periodically.
+# Trigger detection thread
+if start:
+    if source is None:
+        st.sidebar.error("Please select or upload a valid input source.")
+    else:
+        if "det_thread" not in st.session_state or not st.session_state.det_thread.is_alive():
+            det_thread = threading.Thread(target=detection_worker, args=(source,), daemon=True)
+            det_thread.start()
+            st.session_state.det_thread = det_thread
+            st.success("Detection started!")
 
-def main_loop():
-    if not frame_queue.empty():
-        frame = frame_queue.get()
-        video_placeholder.image(frame)
-        update_counts()
+# Display latest frame from queue if available
+if "frame_display" not in st.session_state:
+    st.session_state.frame_display = video_placeholder
 
-# Run the periodic update every 30 ms
-st_autorefresh = st.experimental_data_editor  # Dummy to satisfy linter, ignore
-while True:
-    main_loop()
-    time.sleep(0.03)
+if not frame_queue.empty():
+    frame = frame_queue.get()
+    st.session_state.frame_display.image(frame, channels="RGB")
+    update_counts()

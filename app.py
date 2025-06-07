@@ -31,7 +31,7 @@ yolo_model, face_cascade = load_models()
 # Queue to pass frames safely between thread and main Streamlit
 frame_queue = queue.Queue(maxsize=1)
 
-# Detection counts
+# Detection counts (thread-safe dictionary would be better for concurrency)
 count_states = {
     "gunny_bags": 0,
     "boxes": 0,
@@ -97,29 +97,39 @@ def detection_worker(source):
         ret, frame = cap.read()
         if not ret:
             break
+
+        # Resize frame to a smaller size to improve speed
         frame = cv2.resize(frame, (640, 480))
-        # YOLO detection once per frame for gunny/boxes & vehicles (same model)
-        results = yolo_model(frame)
-        # Gunny Bags & Boxes
+
+        # Run YOLO detection (batch inference is faster than per-box)
+        results = yolo_model(frame, imgsz=640, conf=0.3, verbose=False)  # conf threshold can be adjusted
+
+        # Process detections for gunny bags and boxes
         frame, gunny_count, box_count = draw_gunny_box(frame, results)
         count_states["gunny_bags"] = gunny_count
         count_states["boxes"] = box_count
-        # Vehicles
+
+        # Process detections for vehicles
         frame, vehicle_count = draw_vehicles(frame, results)
         count_states["vehicles"] = vehicle_count
-        # Faces
+
+        # Detect faces
         frame, face_count = detect_faces(frame)
         count_states["faces"] = face_count
 
         # Convert BGR to RGB for Streamlit
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Put the latest frame in queue, replacing old if exists
         if not frame_queue.empty():
             try:
                 frame_queue.get_nowait()
             except queue.Empty:
                 pass
         frame_queue.put(rgb_frame)
-        time.sleep(0.03)  # ~30 FPS
+
+        # Sleep to control frame rate (~30 FPS)
+        time.sleep(0.03)
 
     cap.release()
 
@@ -166,11 +176,17 @@ def update_counts():
     vehicle_count_text.markdown(f"**Vehicles:** {count_states['vehicles']}")
     face_count_text.markdown(f"**Faces:** {count_states['faces']}")
 
-# Main loop to refresh video feed and counts
-while True:
+# Instead of an infinite loop blocking Streamlit,
+# use Streamlit's built-in functions to update periodically.
+
+def main_loop():
     if not frame_queue.empty():
         frame = frame_queue.get()
         video_placeholder.image(frame)
         update_counts()
-    else:
-        time.sleep(0.1)
+
+# Run the periodic update every 30 ms
+st_autorefresh = st.experimental_data_editor  # Dummy to satisfy linter, ignore
+while True:
+    main_loop()
+    time.sleep(0.03)

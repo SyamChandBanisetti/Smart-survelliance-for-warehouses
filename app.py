@@ -10,32 +10,28 @@ import time
 st.set_page_config(page_title="🛡️ Smart Warehouse Surveillance", layout="wide")
 
 st.title("📦 Smart Warehouse Surveillance System")
-
 st.markdown("""
 This app performs **real-time detection** of:
 - Gunny Bags & Boxes
 - Vehicles
 - Faces
 
-Select source(s) in the sidebar, and watch live detections below.
+Upload a video/image file or select your webcam as the single input source.
 """)
 
-# Load models once with cache
+# Load models once (cached)
 @st.cache_resource
 def load_models():
-    yolo_model = YOLO("yolov8n.pt")  # lightweight pretrained COCO model
+    yolo_model = YOLO("yolov8n.pt")
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     return yolo_model, face_cascade
 
 yolo_model, face_cascade = load_models()
 
-# Queues for thread-safe frame passing
-frame_queues = {
-    "gunny_box": queue.Queue(maxsize=1),
-    "vehicle": queue.Queue(maxsize=1),
-    "face": queue.Queue(maxsize=1),
-}
+# Queue to pass frames safely between thread and main Streamlit
+frame_queue = queue.Queue(maxsize=1)
 
+# Detection counts
 count_states = {
     "gunny_bags": 0,
     "boxes": 0,
@@ -43,37 +39,36 @@ count_states = {
     "faces": 0,
 }
 
-# Function to draw bounding boxes for gunny bags and boxes
-def draw_gunny_box(frame, detections):
+def draw_gunny_box(frame, results):
     gunny_count = 0
     box_count = 0
-    for r in detections:
+    for r in results:
         for box in r.boxes:
             cls = int(box.cls)
             class_name = yolo_model.names[cls]
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = box.conf[0]
-            # Define "gunny bags" as backpack, suitcase; boxes as 'box' (or suitcase)
+            # Gunny bags classes (backpack, suitcase)
             if class_name in ["backpack", "suitcase"]:
                 label = "Gunny Bag"
                 color = (0, 255, 0)
                 gunny_count += 1
+            # Boxes class (if available)
             elif class_name == "box":
                 label = "Box"
                 color = (255, 255, 0)
                 box_count += 1
             else:
-                continue  # ignore other classes
+                continue
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     return frame, gunny_count, box_count
 
-# Function to draw bounding boxes for vehicles
-def draw_vehicles(frame, detections):
+def draw_vehicles(frame, results):
     vehicle_classes = ["car", "bus", "truck", "motorbike"]
     vehicle_count = 0
-    for r in detections:
+    for r in results:
         for box in r.boxes:
             cls = int(box.cls)
             class_name = yolo_model.names[cls]
@@ -89,7 +84,6 @@ def draw_vehicles(frame, detections):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     return frame, vehicle_count
 
-# Function to detect and draw faces
 def detect_faces(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
@@ -97,136 +91,86 @@ def detect_faces(frame):
         cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 255), 2)
     return frame, len(faces)
 
-# Worker threads for detection tasks
-def detection_worker(name, source, queue_out):
+def detection_worker(source):
     cap = cv2.VideoCapture(source)
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         frame = cv2.resize(frame, (640, 480))
-        if name == "gunny_box":
-            results = yolo_model(frame)
-            frame, gunny_count, box_count = draw_gunny_box(frame, results)
-            count_states["gunny_bags"] = gunny_count
-            count_states["boxes"] = box_count
-        elif name == "vehicle":
-            results = yolo_model(frame)
-            frame, vehicle_count = draw_vehicles(frame, results)
-            count_states["vehicles"] = vehicle_count
-        elif name == "face":
-            frame, face_count = detect_faces(frame)
-            count_states["faces"] = face_count
-        else:
-            # Should never happen
-            pass
+        # YOLO detection once per frame for gunny/boxes & vehicles (same model)
+        results = yolo_model(frame)
+        # Gunny Bags & Boxes
+        frame, gunny_count, box_count = draw_gunny_box(frame, results)
+        count_states["gunny_bags"] = gunny_count
+        count_states["boxes"] = box_count
+        # Vehicles
+        frame, vehicle_count = draw_vehicles(frame, results)
+        count_states["vehicles"] = vehicle_count
+        # Faces
+        frame, face_count = detect_faces(frame)
+        count_states["faces"] = face_count
 
         # Convert BGR to RGB for Streamlit
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # Put frame in queue, drop old frame if exists
-        if not queue_out.empty():
+        if not frame_queue.empty():
             try:
-                queue_out.get_nowait()
+                frame_queue.get_nowait()
             except queue.Empty:
                 pass
-        queue_out.put(rgb_frame)
+        frame_queue.put(rgb_frame)
         time.sleep(0.03)  # ~30 FPS
 
     cap.release()
 
-# Sidebar UI for inputs
-st.sidebar.header("Input Sources & Controls")
+# Sidebar input
+st.sidebar.header("Select Input Source")
+input_type = st.sidebar.radio("Choose input source:", ["Webcam", "Upload Video/Image"])
 
-def get_source_input(key_prefix):
-    source_type = st.sidebar.radio(f"{key_prefix} Source", ("Webcam", "Upload Video/Image"), key=f"{key_prefix}_src")
-    if source_type == "Webcam":
-        cam_index = st.sidebar.number_input(f"{key_prefix} Camera Index", 0, 10, 0, key=f"{key_prefix}_cam")
-        return cam_index
+source = None
+if input_type == "Webcam":
+    cam_index = st.sidebar.number_input("Camera Index", 0, 10, 0)
+    source = cam_index
+else:
+    uploaded_file = st.sidebar.file_uploader("Upload Video/Image", type=["mp4", "avi", "mov", "mkv", "jpg", "jpeg", "png"])
+    if uploaded_file is not None:
+        tfile = tempfile.NamedTemporaryFile(delete=False)
+        tfile.write(uploaded_file.read())
+        source = tfile.name
+
+start = st.sidebar.button("Start Detection")
+
+if start:
+    if source is None:
+        st.sidebar.error("Please select or upload a valid input source.")
     else:
-        uploaded_file = st.sidebar.file_uploader(f"Upload {key_prefix} Video/Image", 
-                                                 type=["mp4", "avi", "mov", "mkv", "jpg", "jpeg", "png"],
-                                                 key=f"{key_prefix}_upload")
-        if uploaded_file is not None:
-            tfile = tempfile.NamedTemporaryFile(delete=False)
-            tfile.write(uploaded_file.read())
-            return tfile.name
-        else:
-            return None
+        if "det_thread" not in st.session_state or not st.session_state.det_thread.is_alive():
+            det_thread = threading.Thread(target=detection_worker, args=(source,), daemon=True)
+            det_thread.start()
+            st.session_state.det_thread = det_thread
+            st.success("Detection started!")
 
-gunny_box_source = get_source_input("Gunny & Boxes")
-vehicle_source = get_source_input("Vehicle")
-face_source = get_source_input("Face")
+# Main UI showing video and live counts
+st.subheader("Live Surveillance Feed")
+video_placeholder = st.empty()
 
-# Start buttons to trigger detection threads
-start_gunny = st.sidebar.button("Start Gunny & Boxes Detection")
-start_vehicle = st.sidebar.button("Start Vehicle Detection")
-start_face = st.sidebar.button("Start Face Detection")
+st.sidebar.subheader("Live Counts")
+gunny_count_text = st.sidebar.empty()
+box_count_text = st.sidebar.empty()
+vehicle_count_text = st.sidebar.empty()
+face_count_text = st.sidebar.empty()
 
-# Placeholders for video display
-gunny_box_placeholder = st.empty()
-vehicle_placeholder = st.empty()
-face_placeholder = st.empty()
+def update_counts():
+    gunny_count_text.markdown(f"**Gunny Bags:** {count_states['gunny_bags']}")
+    box_count_text.markdown(f"**Boxes:** {count_states['boxes']}")
+    vehicle_count_text.markdown(f"**Vehicles:** {count_states['vehicles']}")
+    face_count_text.markdown(f"**Faces:** {count_states['faces']}")
 
-# Track thread states to prevent multiple starts
-threads = {}
-
-def start_detection_thread(name, source):
-    if name in threads and threads[name].is_alive():
-        return  # already running
-    t = threading.Thread(target=detection_worker, args=(name, source, frame_queues[name]), daemon=True)
-    t.start()
-    threads[name] = t
-
-if start_gunny and gunny_box_source is not None:
-    start_detection_thread("gunny_box", gunny_box_source)
-elif start_gunny:
-    st.sidebar.error("Gunny & Boxes source not selected!")
-
-if start_vehicle and vehicle_source is not None:
-    start_detection_thread("vehicle", vehicle_source)
-elif start_vehicle:
-    st.sidebar.error("Vehicle source not selected!")
-
-if start_face and face_source is not None:
-    start_detection_thread("face", face_source)
-elif start_face:
-    st.sidebar.error("Face source not selected!")
-
-# Main UI columns to display streams and counts
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.subheader("Gunny Bags & Boxes")
-    if "gunny_box" in threads and threads["gunny_box"].is_alive():
-        if not frame_queues["gunny_box"].empty():
-            frame = frame_queues["gunny_box"].get()
-            st.image(frame)
-        st.write(f"Gunny Bags detected: **{count_states['gunny_bags']}**")
-        st.write(f"Boxes detected: **{count_states['boxes']}**")
+# Main loop to refresh video feed and counts
+while True:
+    if not frame_queue.empty():
+        frame = frame_queue.get()
+        video_placeholder.image(frame)
+        update_counts()
     else:
-        st.write("Not running")
-
-with col2:
-    st.subheader("Vehicle Detection")
-    if "vehicle" in threads and threads["vehicle"].is_alive():
-        if not frame_queues["vehicle"].empty():
-            frame = frame_queues["vehicle"].get()
-            st.image(frame)
-        st.write(f"Vehicles detected: **{count_states['vehicles']}**")
-    else:
-        st.write("Not running")
-
-with col3:
-    st.subheader("Face Detection")
-    if "face" in threads and threads["face"].is_alive():
-        if not frame_queues["face"].empty():
-            frame = frame_queues["face"].get()
-            st.image(frame)
-        st.write(f"Faces detected: **{count_states['faces']}**")
-    else:
-        st.write("Not running")
-
-# Footer note
-st.markdown("---")
-st.markdown("Made with ❤️ by Syam Chand - Smart Warehouse Surveillance Demo")
-
+        time.sleep(0.1)
